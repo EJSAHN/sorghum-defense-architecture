@@ -1,503 +1,777 @@
 #!/usr/bin/env python3
 """
-End-to-end pipeline to reproduce derived tables and Supplementary Data S1.
+Generate the supplementary data workbook for the sorghum defense architecture study.
 
-Inputs (expected in --data-dir):
-  - 8leaf_final.xlsx
-  - susceptibility score_Midrib.xlsx
-  - qpcr_leaf_midrib_allocation.csv
-
-Outputs (written to --out-dir):
-  - Supplementary_Data_S1.xlsx
-  - derived_canopy_features.csv
-  - derived_midrib_probs.csv
-  - derived_qpcr_allocation.csv
-  - derived_alignment_jsd.csv
-
-This pipeline does not generate manuscript figures.
+The pipeline reads the three input data files, computes derived tables, and writes
+a single Excel workbook. It does not generate publication figures.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple, Dict, Any
 
 import numpy as np
 import pandas as pd
+from scipy.stats import chi2, fisher_exact, mannwhitneyu
+from sklearn.decomposition import PCA
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
+from statsmodels.miscmodels.ordinal_model import OrderedModel
+from statsmodels.stats.multitest import multipletests
 
-import openpyxl
-from openpyxl.styles import Font, Alignment
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
-# ---------------------------
-# Utilities
-# ---------------------------
+INPUT_ARCHITECTURE = "8leaf_final.xlsx"
+INPUT_TISSUE = "susceptibility score_Midrib.xlsx"
+INPUT_QPCR = "qpcr_leaf_midrib_allocation.csv"
 
-def _require_file(path: Path) -> None:
+SEVERE_THRESHOLD_DEFAULT = 3.0
+BOOTSTRAPS_DEFAULT = 10000
+RANDOM_SEED_DEFAULT = 20260418
+
+
+@dataclass
+class CanopyModelSummary:
+    n_complete_case: int
+    r2_lambda_linear: float
+    r2_greenhouse_quadratic_full: float
+    r2_greenhouse_quadratic_slope_only: float
+
+
+def require_file(path: Path) -> None:
     if not path.exists():
         raise FileNotFoundError(f"Missing required input file: {path}")
 
 
-def _safe_float(x) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return float("nan")
+def safe_number(value):
+    if value is None:
+        return None
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        if math.isnan(float(value)) or math.isinf(float(value)):
+            return None
+        return float(value)
+    return value
 
 
 def jsd_base2(p: np.ndarray, q: np.ndarray) -> float:
-    """
-    Jensen–Shannon divergence (base 2) for discrete distributions p and q.
-    p and q must be 1D arrays that sum to 1.
-    """
+    """Jensen-Shannon divergence using log base 2."""
     p = np.asarray(p, dtype=float)
     q = np.asarray(q, dtype=float)
-
     if p.ndim != 1 or q.ndim != 1 or p.shape != q.shape:
-        raise ValueError("p and q must be 1D arrays of the same shape.")
-
-    # Normalize defensively
+        raise ValueError("p and q must be one-dimensional arrays with the same shape.")
+    if np.any(p < 0) or np.any(q < 0):
+        raise ValueError("Probability vectors cannot contain negative values.")
     p_sum = p.sum()
     q_sum = q.sum()
     if p_sum <= 0 or q_sum <= 0:
-        return float("nan")
+        return np.nan
     p = p / p_sum
     q = q / q_sum
-
     m = 0.5 * (p + q)
 
-    def kl(a: np.ndarray, b: np.ndarray) -> float:
-        # 0 * log(0/.) treated as 0
+    def kl(a, b):
         mask = a > 0
         return float(np.sum(a[mask] * (np.log2(a[mask]) - np.log2(b[mask]))))
 
     return 0.5 * kl(p, m) + 0.5 * kl(q, m)
 
 
-# ---------------------------
-# Canopy features (8leaf_final.xlsx)
-# ---------------------------
+def odds_ratio_ci(a, b, c, d):
+    """Haldane-Anscombe corrected odds ratio and Wald 95% CI."""
+    aa, bb, cc, dd = [x + 0.5 for x in [a, b, c, d]]
+    estimate = (aa * dd) / (bb * cc)
+    se = math.sqrt(1 / aa + 1 / bb + 1 / cc + 1 / dd)
+    z = 1.959963984540054
+    low = math.exp(math.log(estimate) - z * se)
+    high = math.exp(math.log(estimate) + z * se)
+    return estimate, low, high
 
-@dataclass
-class CanopyModelResults:
-    r2_lambda_linear: float
-    r2_funneling_full: float
-    r2_funneling_slope_only: float
-    n_complete_case: int
+
+def bootstrap_difference(x, y, statistic="mean", n_boot=BOOTSTRAPS_DEFAULT, seed=RANDOM_SEED_DEFAULT):
+    """Independent bootstrap for leaf minus midrib differences."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    x = x[~np.isnan(x)]
+    y = y[~np.isnan(y)]
+    if len(x) == 0 or len(y) == 0:
+        return np.nan, np.nan, np.nan, np.nan
+
+    rng = np.random.default_rng(seed)
+    x_samples = rng.choice(x, size=(int(n_boot), len(x)), replace=True)
+    y_samples = rng.choice(y, size=(int(n_boot), len(y)), replace=True)
+
+    if statistic == "mean":
+        observed = float(np.mean(x) - np.mean(y))
+        draws = x_samples.mean(axis=1) - y_samples.mean(axis=1)
+    elif statistic == "median":
+        observed = float(np.median(x) - np.median(y))
+        draws = np.median(x_samples, axis=1) - np.median(y_samples, axis=1)
+    else:
+        raise ValueError("statistic must be 'mean' or 'median'.")
+
+    low, high = np.quantile(draws, [0.025, 0.975])
+    return observed, float(low), float(high), float(np.std(draws, ddof=1))
 
 
-def build_canopy_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build genotype-level canopy features from leaf angle measurements.
+def read_inputs(data_dir: Path):
+    architecture_path = data_dir / INPUT_ARCHITECTURE
+    tissue_path = data_dir / INPUT_TISSUE
+    qpcr_path = data_dir / INPUT_QPCR
+    for path in (architecture_path, tissue_path, qpcr_path):
+        require_file(path)
 
-    Required columns:
-      - cultivar
-      - leaf_no
-      - angle_deg
-      - GH_FSP35 (may contain NaN)
+    architecture = pd.read_excel(architecture_path)
+    tissue = pd.read_excel(tissue_path)
+    qpcr = pd.read_csv(qpcr_path)
+    return architecture, tissue, qpcr
 
-    Returns a genotype-level table with:
-      mean_profile_angle, profile_sd, min_angle, max_angle, angle_range,
-      leaf_slope, intercept,
-      mean_basal_angle (mean of all angles for the genotype),
-      runoff_index, retention_index,
-      GH_FSP35_mean (mean across rows for genotype, ignoring NaN)
-    """
+
+def build_input_audit(architecture, tissue, qpcr):
+    rows = [
+        {
+            "input": INPUT_ARCHITECTURE,
+            "rows": len(architecture),
+            "columns": architecture.shape[1],
+            "note": "Canopy-angle records with linked cultivar-level greenhouse severity annotations.",
+        },
+        {
+            "input": INPUT_TISSUE,
+            "rows": len(tissue),
+            "columns": tissue.shape[1],
+            "note": "Detached-leaf lesion-score records for leaf blade and midrib tissues.",
+        },
+        {
+            "input": INPUT_QPCR,
+            "rows": len(qpcr),
+            "columns": qpcr.shape[1],
+            "note": "qRT-PCR fold-change summaries used to derive tissue-level defense allocation.",
+        },
+    ]
+    return pd.DataFrame(rows)
+
+
+def build_canopy_features(df):
     required = {"cultivar", "leaf_no", "angle_deg", "GH_FSP35"}
     missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"8leaf_final.xlsx missing required columns: {sorted(missing)}")
+        raise ValueError(f"{INPUT_ARCHITECTURE} missing required columns: {sorted(missing)}")
 
-    rows = []
-    for cultivar, g in df.groupby("cultivar", dropna=True):
-        g = g.copy()
+    records = []
+    for cultivar, group in df.groupby("cultivar", dropna=True):
+        g = group.copy()
         g["leaf_no"] = pd.to_numeric(g["leaf_no"], errors="coerce")
         g["angle_deg"] = pd.to_numeric(g["angle_deg"], errors="coerce")
         g["GH_FSP35"] = pd.to_numeric(g["GH_FSP35"], errors="coerce")
-
         g = g.dropna(subset=["leaf_no", "angle_deg"])
         if g.empty:
             continue
 
-        # per-leaf mean angle profile (leaf 1..8)
         leaf_means = g.groupby("leaf_no")["angle_deg"].mean().sort_index()
-
-        mean_profile_angle = float(leaf_means.mean())
-        profile_sd = float(leaf_means.std(ddof=1))
-        min_angle = float(leaf_means.min())
-        max_angle = float(leaf_means.max())
-        angle_range = float(max_angle - min_angle)
-
-        # slope of profile means vs leaf_no
-        if leaf_means.shape[0] >= 2:
-            x = leaf_means.index.to_numpy(dtype=float)
-            y = leaf_means.to_numpy(dtype=float)
-            slope, intercept = np.polyfit(x, y, 1)
+        if len(leaf_means) >= 2:
+            slope, intercept = np.polyfit(
+                leaf_means.index.to_numpy(dtype=float),
+                leaf_means.to_numpy(dtype=float),
+                1,
+            )
         else:
             slope, intercept = np.nan, np.nan
 
         mean_basal_angle = float(g["angle_deg"].mean())
-
-        # physics indices based on mean basal angle
         theta = np.deg2rad(mean_basal_angle)
-        runoff_index = float(np.cos(theta))
-        retention_index = float(np.sin(theta))
+        greenhouse_values = g["GH_FSP35"].dropna()
 
-        gh_vals = g["GH_FSP35"].dropna()
-        gh_mean = float(gh_vals.mean()) if len(gh_vals) > 0 else np.nan
+        records.append({
+            "cultivar": str(cultivar),
+            "mean_profile_angle": float(leaf_means.mean()),
+            "profile_sd": float(leaf_means.std(ddof=1)),
+            "min_angle": float(leaf_means.min()),
+            "max_angle": float(leaf_means.max()),
+            "angle_range": float(leaf_means.max() - leaf_means.min()),
+            "leaf_slope": float(slope),
+            "intercept": float(intercept),
+            "mean_basal_angle": mean_basal_angle,
+            "runoff_index": float(np.cos(theta)),
+            "retention_index": float(np.sin(theta)),
+            "GH_FSP35_mean": float(greenhouse_values.mean()) if len(greenhouse_values) else np.nan,
+            "n_angle_records": int(len(g)),
+            "n_greenhouse_annotation_records": int(len(greenhouse_values)),
+        })
 
-        rows.append(
-            {
-                "cultivar": str(cultivar),
-                "mean_profile_angle": mean_profile_angle,
-                "profile_sd": profile_sd,
-                "min_angle": min_angle,
-                "max_angle": max_angle,
-                "angle_range": angle_range,
-                "leaf_slope": float(slope),
-                "intercept": float(intercept),
-                "mean_basal_angle": mean_basal_angle,
-                "runoff_index": runoff_index,
-                "retention_index": retention_index,
-                "GH_FSP35_mean": gh_mean,
-            }
-        )
-
-    return pd.DataFrame(rows)
+    return pd.DataFrame(records).sort_values("cultivar").reset_index(drop=True)
 
 
-def fit_canopy_models(feats: pd.DataFrame, eps: float = 1e-6) -> Tuple[pd.DataFrame, CanopyModelResults]:
-    """
-    Fit:
-      - linear model: lambda_arch ~ mean_basal_angle + leaf_slope + profile_sd
-      - funneling full: GH_FSP35_mean ~ mean_profile_angle + leaf_slope + profile_sd + leaf_slope^2
-      - funneling slope-only: GH_FSP35_mean ~ leaf_slope + leaf_slope^2
+def build_angle_by_leaf(df):
+    required = {"cultivar", "leaf_no", "angle_deg"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{INPUT_ARCHITECTURE} missing required columns: {sorted(missing)}")
+    d = df.copy()
+    d["leaf_no"] = pd.to_numeric(d["leaf_no"], errors="coerce")
+    d["angle_deg"] = pd.to_numeric(d["angle_deg"], errors="coerce")
+    d = d.dropna(subset=["cultivar", "leaf_no", "angle_deg"])
+    out = (
+        d.groupby(["cultivar", "leaf_no"], dropna=True)["angle_deg"]
+        .agg(["count", "mean", "std", "min", "max"])
+        .reset_index()
+        .rename(columns={
+            "count": "n",
+            "mean": "mean_angle_deg",
+            "std": "sd_angle_deg",
+            "min": "min_angle_deg",
+            "max": "max_angle_deg",
+        })
+    )
+    return out.sort_values(["cultivar", "leaf_no"]).reset_index(drop=True)
 
-    Note: lambda_arch uses p_severe_GH normalized from GH_FSP35_mean to [0,1] using max scaling.
-    """
-    df = feats.copy()
 
-    # complete-case for GH models
-    cc = df.dropna(subset=["GH_FSP35_mean", "mean_profile_angle", "leaf_slope", "profile_sd", "mean_basal_angle"]).reset_index(drop=True)
-    n = cc.shape[0]
-    if n < 3:
-        raise ValueError(f"Not enough complete-case genotypes for canopy models (n={n}).")
+def build_pca_tables(angle_by_leaf):
+    profile = angle_by_leaf.pivot(index="cultivar", columns="leaf_no", values="mean_angle_deg")
+    profile = profile.sort_index(axis=1)
+    used_column_means = profile.mean(axis=0)
+    profile_filled = profile.fillna(used_column_means)
+    n_components = min(2, profile_filled.shape[0], profile_filled.shape[1])
+    if n_components < 2:
+        return pd.DataFrame(), pd.DataFrame()
 
-    # Normalize GH severity to [0,1] via max scaling (matches earlier manuscript usage in this project)
-    gh = cc["GH_FSP35_mean"].to_numpy(dtype=float)
+    pca = PCA(n_components=2)
+    scores = pca.fit_transform(profile_filled.to_numpy(dtype=float))
+    score_df = pd.DataFrame({
+        "cultivar": profile_filled.index.astype(str),
+        "PC1": scores[:, 0],
+        "PC2": scores[:, 1],
+    })
+    explained = pd.DataFrame({
+        "component": ["PC1", "PC2"],
+        "explained_variance_ratio": pca.explained_variance_ratio_,
+    })
+    return score_df, explained
+
+
+def fit_canopy_models(features, eps=1e-6):
+    complete = features.dropna(
+        subset=["GH_FSP35_mean", "mean_profile_angle", "leaf_slope", "profile_sd", "mean_basal_angle"]
+    ).reset_index(drop=True)
+    if len(complete) < 3:
+        raise ValueError("Not enough complete-case genotypes for canopy models.")
+
+    gh = complete["GH_FSP35_mean"].to_numpy(dtype=float)
     gh_max = float(np.nanmax(gh))
     if gh_max <= 0:
-        raise ValueError("GH_FSP35_mean max is non-positive; cannot normalize.")
-    p_severe = gh / gh_max
-    lambda_arch = -np.log(p_severe + float(eps))
-    cc["p_severe_GH"] = p_severe
-    cc["lambda_arch"] = lambda_arch
+        raise ValueError("Maximum greenhouse severity must be positive.")
+    complete["p_severe_GH_scaled"] = gh / gh_max
+    complete["lambda_arch"] = -np.log(complete["p_severe_GH_scaled"].to_numpy(dtype=float) + float(eps))
 
-    # linear lambda model
-    X_l = cc[["mean_basal_angle", "leaf_slope", "profile_sd"]].to_numpy(dtype=float)
-    y_l = cc["lambda_arch"].to_numpy(dtype=float)
-    m_l = LinearRegression().fit(X_l, y_l)
-    r2_lambda = r2_score(y_l, m_l.predict(X_l))
+    predictors = ["mean_basal_angle", "leaf_slope", "profile_sd"]
+    model_lambda = LinearRegression().fit(complete[predictors], complete["lambda_arch"])
+    complete["lambda_arch_pred"] = model_lambda.predict(complete[predictors])
+    r2_lambda = r2_score(complete["lambda_arch"], complete["lambda_arch_pred"])
 
-    # funneling full (predict GH directly)
-    slope = cc["leaf_slope"].to_numpy(dtype=float)
-    X_f = np.column_stack([
-        cc["mean_profile_angle"].to_numpy(dtype=float),
+    slope = complete["leaf_slope"].to_numpy(dtype=float)
+    full_x = np.column_stack([
+        complete["mean_profile_angle"].to_numpy(dtype=float),
         slope,
-        cc["profile_sd"].to_numpy(dtype=float),
+        complete["profile_sd"].to_numpy(dtype=float),
         slope ** 2,
     ])
-    y_f = cc["GH_FSP35_mean"].to_numpy(dtype=float)
-    m_f = LinearRegression().fit(X_f, y_f)
-    r2_full = r2_score(y_f, m_f.predict(X_f))
+    y = complete["GH_FSP35_mean"].to_numpy(dtype=float)
+    model_full = LinearRegression().fit(full_x, y)
+    complete["GH_pred_quadratic_full"] = model_full.predict(full_x)
+    r2_full = r2_score(y, complete["GH_pred_quadratic_full"])
 
-    # slope-only quadratic
-    X_s = np.column_stack([slope, slope ** 2])
-    m_s = LinearRegression().fit(X_s, y_f)
-    r2_slope_only = r2_score(y_f, m_s.predict(X_s))
+    slope_x = np.column_stack([slope, slope ** 2])
+    model_slope = LinearRegression().fit(slope_x, y)
+    complete["GH_pred_quadratic_slope_only"] = model_slope.predict(slope_x)
+    r2_slope = r2_score(y, complete["GH_pred_quadratic_slope_only"])
 
-    results = CanopyModelResults(
+    summary = CanopyModelSummary(
+        n_complete_case=int(len(complete)),
         r2_lambda_linear=float(r2_lambda),
-        r2_funneling_full=float(r2_full),
-        r2_funneling_slope_only=float(r2_slope_only),
-        n_complete_case=int(n),
+        r2_greenhouse_quadratic_full=float(r2_full),
+        r2_greenhouse_quadratic_slope_only=float(r2_slope),
+    )
+    model_table = pd.DataFrame([
+        {"model": "lambda_arch_linear", "response": "lambda_arch", "n_complete_case": len(complete), "r2": r2_lambda},
+        {"model": "greenhouse_quadratic_full", "response": "GH_FSP35_mean", "n_complete_case": len(complete), "r2": r2_full},
+        {"model": "greenhouse_quadratic_slope_only", "response": "GH_FSP35_mean", "n_complete_case": len(complete), "r2": r2_slope},
+    ])
+    return complete, model_table, summary
+
+
+def standardize_tissue_table(df):
+    required = {"cultivar", "tissue", "FSP35_score"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{INPUT_TISSUE} missing required columns: {sorted(missing)}")
+
+    d = df.copy()
+    d["cultivar"] = d["cultivar"].astype(str).str.strip()
+    d["tissue"] = d["tissue"].astype(str).str.strip().str.capitalize()
+    d["tissue"] = d["tissue"].replace({"Blade": "Leaf", "Lamina": "Leaf"})
+    d["FSP35_score"] = pd.to_numeric(d["FSP35_score"], errors="coerce")
+    d = d[d["tissue"].isin(["Leaf", "Midrib"])].copy()
+    return d
+
+
+def compute_tissue_probabilities(tissue, severe_threshold=SEVERE_THRESHOLD_DEFAULT):
+    d = standardize_tissue_table(tissue)
+    d = d.dropna(subset=["cultivar", "tissue"]).copy()
+
+    audit = (
+        d.assign(
+            score_nonmissing=d["FSP35_score"].notna(),
+            severe=d["FSP35_score"].ge(float(severe_threshold)) & d["FSP35_score"].notna(),
+        )
+        .groupby(["cultivar", "tissue"], dropna=True)
+        .agg(
+            total_rows=("FSP35_score", "size"),
+            nonmissing_score_rows=("score_nonmissing", "sum"),
+            missing_score_rows=("score_nonmissing", lambda x: int((~x).sum())),
+            severe_score_rows=("severe", "sum"),
+        )
+        .reset_index()
+    )
+    audit["nonsevere_score_rows"] = audit["nonmissing_score_rows"] - audit["severe_score_rows"]
+    audit["p_severe"] = np.where(
+        audit["nonmissing_score_rows"] > 0,
+        audit["severe_score_rows"] / audit["nonmissing_score_rows"],
+        np.nan,
     )
 
-    # Add predictions back for auditing
-    cc["lambda_arch_pred"] = m_l.predict(X_l)
-    cc["GH_pred_full"] = m_f.predict(X_f)
-    cc["GH_pred_slope_only"] = m_s.predict(X_s)
+    wide_p = audit.pivot(index="cultivar", columns="tissue", values="p_severe").rename(
+        columns={"Leaf": "p_leaf", "Midrib": "p_midrib"}
+    )
+    wide_n = audit.pivot(index="cultivar", columns="tissue", values="nonmissing_score_rows").rename(
+        columns={"Leaf": "n_leaf", "Midrib": "n_midrib"}
+    )
+    wide_missing = audit.pivot(index="cultivar", columns="tissue", values="missing_score_rows").rename(
+        columns={"Leaf": "missing_leaf_scores", "Midrib": "missing_midrib_scores"}
+    )
 
-    return cc, results
-
-
-# ---------------------------
-# Tissue susceptibility (susceptibility score_Midrib.xlsx)
-# ---------------------------
-
-def compute_midrib_probs(df: pd.DataFrame, severe_threshold: float = 3.0) -> pd.DataFrame:
-    """
-    Compute p_leaf and p_midrib as absolute probabilities of severe infection for FSP35 in excised-leaf assays.
-
-    Severe is defined as FSP35_score >= severe_threshold.
-
-    Important: Rows with missing FSP35_score are retained and treated as non-severe in the denominator.
-    This matches the convention used in the manuscript tables where unscored sites contribute to the total
-    number of evaluated sites for a cultivar/tissue.
-    """
-    required = {"cultivar", "FSP35_score", "tissue"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"susceptibility score_Midrib.xlsx missing required columns: {sorted(missing)}")
-
-    d = df.copy()
-    d["FSP35_score"] = pd.to_numeric(d["FSP35_score"], errors="coerce")
-    d = d.dropna(subset=["cultivar", "tissue"])
-
-    # Comparison with NaN yields False, which is the desired behavior here.
-    d["is_severe"] = d["FSP35_score"] >= float(severe_threshold)
-
-    out_rows = []
-    for cultivar, g in d.groupby("cultivar", dropna=True):
-        for tissue in ["Leaf", "Midrib"]:
-            gg = g[g["tissue"].astype(str).str.strip().str.lower() == tissue.lower()]
-            if gg.empty:
-                continue
-            p = float(gg["is_severe"].mean())  # denominator includes NaN scores (treated as non-severe)
-            out_rows.append({"cultivar": str(cultivar), "tissue": tissue, "p_severe": p, "n_sites": int(gg.shape[0])})
-
-    out = pd.DataFrame(out_rows)
-
-    # Pivot to wide
-    wide = out.pivot_table(index="cultivar", columns="tissue", values="p_severe", aggfunc="first")
-    wide = wide.rename(columns={"Leaf": "p_leaf", "Midrib": "p_midrib"}).reset_index()
-    wide["delta_p"] = wide["p_leaf"] - wide["p_midrib"]
-    return wide
+    out = pd.concat([wide_n, wide_missing, wide_p], axis=1).reset_index()
+    out["delta_p_leaf_minus_midrib"] = out["p_leaf"] - out["p_midrib"]
+    return out.sort_values("cultivar").reset_index(drop=True), audit.sort_values(["cultivar", "tissue"]).reset_index(drop=True)
 
 
-# ---------------------------
-# qPCR allocation (qpcr_leaf_midrib_allocation.csv)
-# ---------------------------
+def compute_tissue_ordinal_tests(tissue, severe_threshold=SEVERE_THRESHOLD_DEFAULT, n_boot=BOOTSTRAPS_DEFAULT, seed=RANDOM_SEED_DEFAULT):
+    d = standardize_tissue_table(tissue)
+    d = d.dropna(subset=["cultivar", "tissue", "FSP35_score"]).copy()
 
-def compute_defense_allocation(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert fold-changes to a two-element defense allocation distribution per cultivar:
-      p_def_leaf = leaf_fc / (leaf_fc + mid_fc)
-      p_def_midrib = 1 - p_def_leaf
+    rows = []
+    for cultivar, group in d.groupby("cultivar", dropna=True):
+        leaf = group.loc[group["tissue"] == "Leaf", "FSP35_score"].dropna().to_numpy(dtype=float)
+        midrib = group.loc[group["tissue"] == "Midrib", "FSP35_score"].dropna().to_numpy(dtype=float)
+        if len(leaf) == 0 or len(midrib) == 0:
+            continue
 
-    Then average across genes and time points for each cultivar.
-    """
-    required = {"cultivar", "leaf_fc", "mid_fc"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"qpcr_leaf_midrib_allocation.csv missing required columns: {sorted(missing)}")
+        mw = mannwhitneyu(leaf, midrib, alternative="two-sided")
+        u_stat = float(mw.statistic)
+        rank_biserial = (2 * u_stat) / (len(leaf) * len(midrib)) - 1
 
-    d = df.copy()
-    d["leaf_fc"] = pd.to_numeric(d["leaf_fc"], errors="coerce")
-    d["mid_fc"] = pd.to_numeric(d["mid_fc"], errors="coerce")
-    d = d.dropna(subset=["cultivar", "leaf_fc", "mid_fc"])
+        mean_diff, mean_low, mean_high, mean_boot_sd = bootstrap_difference(
+            leaf, midrib, statistic="mean", n_boot=n_boot, seed=seed
+        )
+        median_diff, median_low, median_high, median_boot_sd = bootstrap_difference(
+            leaf, midrib, statistic="median", n_boot=n_boot, seed=seed + 17
+        )
 
-    denom = d["leaf_fc"] + d["mid_fc"]
-    d = d[denom > 0].copy()
-    d["p_def_leaf"] = d["leaf_fc"] / denom
-    d["p_def_midrib"] = 1.0 - d["p_def_leaf"]
+        leaf_severe = int(np.sum(leaf >= severe_threshold))
+        leaf_nonsevere = int(np.sum(leaf < severe_threshold))
+        midrib_severe = int(np.sum(midrib >= severe_threshold))
+        midrib_nonsevere = int(np.sum(midrib < severe_threshold))
+        _, fisher_p = fisher_exact(
+            [[leaf_severe, leaf_nonsevere], [midrib_severe, midrib_nonsevere]],
+            alternative="two-sided",
+        )
+        odds_ratio, odds_low, odds_high = odds_ratio_ci(leaf_severe, leaf_nonsevere, midrib_severe, midrib_nonsevere)
 
-    # Average across gene/time per cultivar
-    summary = d.groupby("cultivar", dropna=True)[["p_def_leaf", "p_def_midrib"]].mean().reset_index()
-    summary["cultivar"] = summary["cultivar"].astype(str)
-    return summary
+        rows.append({
+            "genotype": str(cultivar),
+            "leaf_n": int(len(leaf)),
+            "midrib_n": int(len(midrib)),
+            "leaf_mean_score": float(np.mean(leaf)),
+            "midrib_mean_score": float(np.mean(midrib)),
+            "leaf_median_score": float(np.median(leaf)),
+            "midrib_median_score": float(np.median(midrib)),
+            "mean_diff_leaf_minus_midrib": mean_diff,
+            "mean_diff_95ci_low": mean_low,
+            "mean_diff_95ci_high": mean_high,
+            "median_diff_leaf_minus_midrib": median_diff,
+            "median_diff_95ci_low": median_low,
+            "median_diff_95ci_high": median_high,
+            "mann_whitney_p": float(mw.pvalue),
+            "rank_biserial_correlation": float(rank_biserial),
+            "p_severe_leaf": float(np.mean(leaf >= severe_threshold)),
+            "p_severe_midrib": float(np.mean(midrib >= severe_threshold)),
+            "fisher_exact_p": float(fisher_p),
+            "odds_ratio_leaf_vs_midrib": float(odds_ratio),
+            "odds_ratio_95ci_low": float(odds_low),
+            "odds_ratio_95ci_high": float(odds_high),
+        })
 
-
-# ---------------------------
-# Alignment table (Table 2) and portfolio
-# ---------------------------
-
-def build_alignment_table(midrib: pd.DataFrame, defense: pd.DataFrame) -> pd.DataFrame:
-    """
-    Join midrib probabilities (p_leaf, p_midrib) with defense allocation (p_def_leaf, p_def_midrib),
-    normalize attack, and compute JSD (base 2).
-    """
-    m = midrib.copy()
-    d = defense.copy()
-
-    merged = m.merge(d, on="cultivar", how="inner")
-    merged = merged.dropna(subset=["p_leaf", "p_midrib", "p_def_leaf", "p_def_midrib"]).reset_index(drop=True)
-
-    p_sum = merged["p_leaf"] + merged["p_midrib"]
-    merged["P_attack_leaf_norm"] = merged["p_leaf"] / p_sum
-    merged["P_attack_midrib_norm"] = merged["p_midrib"] / p_sum
-
-    jsd_vals = []
-    for _, r in merged.iterrows():
-        p_attack = np.array([r["P_attack_leaf_norm"], r["P_attack_midrib_norm"]], dtype=float)
-        p_def = np.array([r["p_def_leaf"], r["p_def_midrib"]], dtype=float)
-        jsd_vals.append(jsd_base2(p_attack, p_def))
-    merged["JSD_attack_defense"] = jsd_vals
-    merged["risk_JSD"] = merged["JSD_attack_defense"]
-    merged["return_defense"] = 1.0 - (merged["p_leaf"] + merged["p_midrib"]) / 2.0
-
-    # Standardize column naming for manuscript-friendly exports
-    out = merged[[
-        "cultivar",
-        "p_leaf", "p_midrib",
-        "P_attack_leaf_norm", "P_attack_midrib_norm",
-        "p_def_leaf", "p_def_midrib",
-        "JSD_attack_defense", "risk_JSD", "return_defense",
-        "delta_p",
-    ]].copy()
-
+    out = pd.DataFrame(rows).sort_values("genotype").reset_index(drop=True)
+    if len(out):
+        out["mann_whitney_fdr_p"] = multipletests(out["mann_whitney_p"], method="fdr_bh")[1]
+        out["fisher_exact_fdr_p"] = multipletests(out["fisher_exact_p"], method="fdr_bh")[1]
     return out
 
 
-# ---------------------------
-# Excel writer
-# ---------------------------
+def fit_pooled_ordinal_models(tissue):
+    d = standardize_tissue_table(tissue)
+    d = d.dropna(subset=["cultivar", "tissue", "FSP35_score"]).copy()
+    d["score_int"] = d["FSP35_score"].round().astype(int)
 
-def write_supplementary_excel(
-    out_path: Path,
-    canopy_raw: pd.DataFrame,
-    canopy_features: pd.DataFrame,
-    canopy_cc: pd.DataFrame,
-    midrib_probs: pd.DataFrame,
-    qpcr_summary: pd.DataFrame,
-    alignment: pd.DataFrame,
-    model_results: CanopyModelResults,
-) -> None:
-    """
-    Write a submission-friendly Supplementary_Data_S1.xlsx with a README sheet and key derived tables.
-    """
-    wb = openpyxl.Workbook()
-    # Remove default sheet
-    wb.remove(wb.active)
+    cultivar_dummies = pd.get_dummies(d["cultivar"], prefix="cultivar", drop_first=True, dtype=float)
+    tissue_leaf = (d["tissue"] == "Leaf").astype(float).rename("tissue_leaf")
 
-    bold = Font(bold=True)
+    exog0 = cultivar_dummies.copy()
+    exog1 = pd.concat([cultivar_dummies, tissue_leaf], axis=1)
+    interaction = cultivar_dummies.mul(tissue_leaf, axis=0)
+    interaction.columns = [f"{col}:tissue_leaf" for col in interaction.columns]
+    exog2 = pd.concat([cultivar_dummies, tissue_leaf, interaction], axis=1)
 
-    def add_sheet_from_df(name: str, df: pd.DataFrame) -> None:
-        ws = wb.create_sheet(name)
-        # Header
-        for j, col in enumerate(df.columns, start=1):
-            cell = ws.cell(row=1, column=j, value=str(col))
-            cell.font = bold
-            ws.column_dimensions[get_column_letter(j)].width = max(14, min(32, len(str(col)) + 2))
-        # Rows
-        for i, (_, r) in enumerate(df.iterrows(), start=2):
-            for j, col in enumerate(df.columns, start=1):
-                val = r[col]
-                ws.cell(row=i, column=j, value=_safe_float(val) if isinstance(val, (np.floating, float, int, np.integer)) else val)
-        ws.freeze_panes = "A2"
+    y = d["score_int"]
 
-    # README
-    ws0 = wb.create_sheet("00_README", 0)
-    ws0["A1"] = "Supplementary Data S1"
-    ws0["A1"].font = Font(bold=True, size=14)
-    ws0["A3"] = "Raw inputs"
-    ws0["A3"].font = bold
-    ws0["B3"] = "8leaf_final.xlsx; susceptibility score_Midrib.xlsx; qpcr_leaf_midrib_allocation.csv"
-    ws0["A5"] = "Canopy model (complete-case)"
-    ws0["A5"].font = bold
-    ws0["B5"] = f"n = {model_results.n_complete_case}; R2_full_quadratic = {model_results.r2_funneling_full:.3f}; R2_slope_only_quadratic = {model_results.r2_funneling_slope_only:.3f}; R2_lambda_linear = {model_results.r2_lambda_linear:.3f}"
-    ws0["A7"] = "Probability vs distribution (important)"
-    ws0["A7"].font = bold
-    ws0["B7"] = ("p_leaf and p_midrib are absolute probabilities of severe infection (FSP35 excised-leaf assays) "
-                 "and do not sum to 1. For JSD, they are normalized to P_attack = [p_leaf/(p_leaf+p_midrib), p_midrib/(p_leaf+p_midrib)].")
-    ws0["A9"] = "JSD"
-    ws0["A9"].font = bold
-    ws0["B9"] = "JSD is computed between normalized P_attack and P_defense using log base 2."
-    ws0.column_dimensions["A"].width = 32
-    ws0.column_dimensions["B"].width = 120
-    ws0["B3"].alignment = Alignment(wrap_text=True)
-    ws0["B7"].alignment = Alignment(wrap_text=True)
+    res0 = OrderedModel(y, exog0, distr="logit").fit(method="bfgs", disp=False)
+    res1 = OrderedModel(y, exog1, distr="logit").fit(method="bfgs", disp=False)
+    res2 = OrderedModel(y, exog2, distr="logit").fit(method="bfgs", disp=False)
 
-    # Sheets
-    add_sheet_from_df("Angle_by_leaf", canopy_raw[["cultivar", "leaf_no", "angle_deg", "GH_FSP35"]].copy())
-    add_sheet_from_df("Arch_summary", canopy_features.copy())
-    add_sheet_from_df("Physics_LambdaArch_cc", canopy_cc.copy())
-    add_sheet_from_df("Midrib_probs", midrib_probs.copy())
-    add_sheet_from_df("qPCR_defense_alloc", qpcr_summary.copy())
-    add_sheet_from_df("Table2_alignment_clean", alignment.copy())
+    lr_tissue = 2 * (res1.llf - res0.llf)
+    df_tissue = exog1.shape[1] - exog0.shape[1]
+    p_tissue = chi2.sf(lr_tissue, df_tissue)
 
-    wb.save(out_path)
+    lr_interaction = 2 * (res2.llf - res1.llf)
+    df_interaction = exog2.shape[1] - exog1.shape[1]
+    p_interaction = chi2.sf(lr_interaction, df_interaction)
+
+    model_summary = pd.DataFrame([
+        {"model": "cultivar_only", "n_obs": len(d), "log_likelihood": res0.llf, "aic": res0.aic, "n_predictor_terms": exog0.shape[1]},
+        {"model": "cultivar_plus_tissue", "n_obs": len(d), "log_likelihood": res1.llf, "aic": res1.aic, "n_predictor_terms": exog1.shape[1]},
+        {"model": "cultivar_tissue_interaction", "n_obs": len(d), "log_likelihood": res2.llf, "aic": res2.aic, "n_predictor_terms": exog2.shape[1]},
+    ])
+
+    tests = pd.DataFrame([
+        {"comparison": "add_tissue_to_cultivar_model", "lr_statistic": lr_tissue, "df": df_tissue, "p_value": p_tissue},
+        {"comparison": "add_cultivar_by_tissue_interaction", "lr_statistic": lr_interaction, "df": df_interaction, "p_value": p_interaction},
+    ])
+
+    coef = pd.DataFrame({
+        "term": res1.params.index,
+        "estimate": res1.params.values,
+        "model": "cultivar_plus_tissue",
+    })
+    return model_summary, tests, coef
 
 
-# ---------------------------
-# Main
-# ---------------------------
+def compute_defense_allocation(qpcr):
+    required = {"cultivar", "leaf_fc", "mid_fc"}
+    missing = required - set(qpcr.columns)
+    if missing:
+        raise ValueError(f"{INPUT_QPCR} missing required columns: {sorted(missing)}")
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data-dir", type=str, required=True, help="Directory containing the three raw input files.")
-    ap.add_argument("--out-dir", type=str, required=True, help="Output directory.")
-    ap.add_argument("--eps", type=float, default=1e-6, help="Small constant epsilon for lambda_arch.")
-    ap.add_argument("--severe-threshold", type=float, default=3.0, help="Threshold for severe infection in excised-leaf scores (FSP35_score).")
-    ap.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs if present.")
-    args = ap.parse_args()
+    d = qpcr.copy()
+    d["cultivar"] = d["cultivar"].astype(str).str.strip()
+    d["leaf_fc"] = pd.to_numeric(d["leaf_fc"], errors="coerce")
+    d["mid_fc"] = pd.to_numeric(d["mid_fc"], errors="coerce")
+    d = d.dropna(subset=["cultivar", "leaf_fc", "mid_fc"]).copy()
+    denominator = d["leaf_fc"] + d["mid_fc"]
+    d = d[denominator > 0].copy()
+    denominator = d["leaf_fc"] + d["mid_fc"]
+    d["p_defense_leaf"] = d["leaf_fc"] / denominator
+    d["p_defense_midrib"] = 1.0 - d["p_defense_leaf"]
+
+    allocation = (
+        d.groupby("cultivar", dropna=True)[["p_defense_leaf", "p_defense_midrib"]]
+        .mean()
+        .reset_index()
+        .sort_values("cultivar")
+    )
+    allocation["cultivar"] = allocation["cultivar"].astype(str)
+    return allocation, d
+
+
+def build_alignment_table(tissue_probabilities, defense_allocation):
+    merged = tissue_probabilities.merge(defense_allocation, on="cultivar", how="inner")
+    merged = merged.dropna(subset=["p_leaf", "p_midrib", "p_defense_leaf", "p_defense_midrib"]).copy()
+
+    total_attack = merged["p_leaf"] + merged["p_midrib"]
+    merged = merged[total_attack > 0].copy()
+    total_attack = merged["p_leaf"] + merged["p_midrib"]
+
+    merged["p_attack_leaf_normalized"] = merged["p_leaf"] / total_attack
+    merged["p_attack_midrib_normalized"] = merged["p_midrib"] / total_attack
+
+    jsd_values = []
+    for _, row in merged.iterrows():
+        attack = np.array([row["p_attack_leaf_normalized"], row["p_attack_midrib_normalized"]], dtype=float)
+        defense = np.array([row["p_defense_leaf"], row["p_defense_midrib"]], dtype=float)
+        jsd_values.append(jsd_base2(attack, defense))
+    merged["jsd_attack_defense"] = jsd_values
+    merged["overall_protection"] = 1.0 - (merged["p_leaf"] + merged["p_midrib"]) / 2.0
+
+    return merged[[
+        "cultivar",
+        "p_leaf",
+        "p_midrib",
+        "p_attack_leaf_normalized",
+        "p_attack_midrib_normalized",
+        "p_defense_leaf",
+        "p_defense_midrib",
+        "jsd_attack_defense",
+        "overall_protection",
+        "delta_p_leaf_minus_midrib",
+    ]].sort_values("cultivar").reset_index(drop=True)
+
+
+def build_manuscript_table2(alignment):
+    out = alignment.rename(columns={
+        "cultivar": "Cultivar",
+        "p_leaf": "p(severe) leaf (FSP35)",
+        "p_midrib": "p(severe) midrib (FSP35)",
+        "p_attack_leaf_normalized": "p(attack) leaf (normalized)",
+        "p_attack_midrib_normalized": "p(attack) midrib (normalized)",
+        "p_defense_leaf": "p(defense) leaf (FSP53 qPCR)",
+        "p_defense_midrib": "p(defense) midrib (FSP53 qPCR)",
+        "jsd_attack_defense": "JSD (attack-defense)",
+        "overall_protection": "Return (overall protection)",
+    })
+    return out[[
+        "Cultivar",
+        "p(severe) leaf (FSP35)",
+        "p(severe) midrib (FSP35)",
+        "p(attack) leaf (normalized)",
+        "p(attack) midrib (normalized)",
+        "p(defense) leaf (FSP53 qPCR)",
+        "p(defense) midrib (FSP53 qPCR)",
+        "JSD (attack-defense)",
+        "Return (overall protection)",
+    ]]
+
+
+def build_manuscript_table_s1(tissue_tests):
+    cols = [
+        "genotype",
+        "leaf_n",
+        "midrib_n",
+        "leaf_mean_score",
+        "midrib_mean_score",
+        "mean_diff_leaf_minus_midrib",
+        "mean_diff_95ci_low",
+        "mean_diff_95ci_high",
+        "mann_whitney_p",
+        "mann_whitney_fdr_p",
+        "p_severe_leaf",
+        "p_severe_midrib",
+        "fisher_exact_p",
+    ]
+    out = tissue_tests[cols].copy()
+    out = out.rename(columns={
+        "genotype": "Genotype",
+        "leaf_n": "Leaf n",
+        "midrib_n": "Midrib n",
+        "leaf_mean_score": "Leaf mean score",
+        "midrib_mean_score": "Midrib mean score",
+        "mean_diff_leaf_minus_midrib": "Mean diff (Leaf-Midrib)",
+        "mean_diff_95ci_low": "95% CI low",
+        "mean_diff_95ci_high": "95% CI high",
+        "mann_whitney_p": "Mann-Whitney p",
+        "mann_whitney_fdr_p": "Mann-Whitney FDR p",
+        "p_severe_leaf": "p(severe) leaf",
+        "p_severe_midrib": "p(severe) midrib",
+        "fisher_exact_p": "Fisher exact p",
+    })
+    return out
+
+
+def format_sheet(sheet):
+    header_fill = PatternFill("solid", fgColor="D9EAF7")
+    header_font = Font(bold=True)
+    for cell in sheet[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = sheet.dimensions
+    for col_idx, column_cells in enumerate(sheet.columns, start=1):
+        max_len = 10
+        for cell in column_cells:
+            value = cell.value
+            if value is None:
+                continue
+            max_len = max(max_len, min(len(str(value)), 50))
+            if isinstance(value, float):
+                cell.number_format = "0.000000"
+        sheet.column_dimensions[get_column_letter(col_idx)].width = max(12, min(max_len + 2, 32))
+
+
+def add_dataframe_sheet(workbook, name, dataframe):
+    sheet = workbook.create_sheet(name)
+    for col_idx, col in enumerate(dataframe.columns, start=1):
+        sheet.cell(row=1, column=col_idx, value=str(col))
+    for row_idx, (_, row) in enumerate(dataframe.iterrows(), start=2):
+        for col_idx, col in enumerate(dataframe.columns, start=1):
+            sheet.cell(row=row_idx, column=col_idx, value=safe_number(row[col]))
+    format_sheet(sheet)
+
+
+def write_workbook(
+    output_path,
+    readme_rows,
+    input_audit,
+    angle_by_leaf,
+    canopy_features,
+    pca_scores,
+    pca_explained,
+    canopy_complete,
+    canopy_model_table,
+    tissue_probability_audit,
+    tissue_probabilities,
+    tissue_tests,
+    ordinal_model_summary,
+    ordinal_lr_tests,
+    ordinal_coefficients,
+    qpcr_allocation_records,
+    defense_allocation,
+    alignment,
+    manuscript_table2,
+    manuscript_table_s1,
+):
+    workbook = Workbook()
+    default = workbook.active
+    workbook.remove(default)
+
+    readme = workbook.create_sheet("00_README")
+    readme["A1"] = "Supplementary data workbook"
+    readme["A1"].font = Font(bold=True, size=14)
+    readme["A3"] = "Notes"
+    readme["A3"].font = Font(bold=True)
+    for idx, text in enumerate(readme_rows, start=4):
+        readme.cell(row=idx, column=1, value=text)
+        readme.cell(row=idx, column=1).alignment = Alignment(wrap_text=True)
+    readme.column_dimensions["A"].width = 120
+
+    add_dataframe_sheet(workbook, "01_Input_Audit", input_audit)
+    add_dataframe_sheet(workbook, "02_Angle_by_Leaf", angle_by_leaf)
+    add_dataframe_sheet(workbook, "03_Canopy_Traits", canopy_features)
+    add_dataframe_sheet(workbook, "04_Canopy_PCA_Scores", pca_scores)
+    add_dataframe_sheet(workbook, "05_Canopy_PCA_Variance", pca_explained)
+    add_dataframe_sheet(workbook, "06_Canopy_Model_Data", canopy_complete)
+    add_dataframe_sheet(workbook, "07_Canopy_Model_Summary", canopy_model_table)
+    add_dataframe_sheet(workbook, "08_Tissue_Probability_Audit", tissue_probability_audit)
+    add_dataframe_sheet(workbook, "09_Tissue_Probabilities", tissue_probabilities)
+    add_dataframe_sheet(workbook, "10_Tissue_Ordinal_Tests", tissue_tests)
+    add_dataframe_sheet(workbook, "11_Pooled_Ordinal_Models", ordinal_model_summary)
+    add_dataframe_sheet(workbook, "12_Pooled_Ordinal_Tests", ordinal_lr_tests)
+    add_dataframe_sheet(workbook, "13_Pooled_Ordinal_Coefficients", ordinal_coefficients)
+    add_dataframe_sheet(workbook, "14_qPCR_Allocation_Records", qpcr_allocation_records)
+    add_dataframe_sheet(workbook, "15_Defense_Allocation", defense_allocation)
+    add_dataframe_sheet(workbook, "16_Attack_Defense_JSD", alignment)
+    add_dataframe_sheet(workbook, "17_Manuscript_Table2", manuscript_table2)
+    add_dataframe_sheet(workbook, "18_Manuscript_TableS1", manuscript_table_s1)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(output_path)
+
+
+def run_analysis(data_dir, out_dir, severe_threshold, n_boot, seed, overwrite):
+    architecture, tissue, qpcr = read_inputs(data_dir)
+
+    input_audit = build_input_audit(architecture, tissue, qpcr)
+    angle_by_leaf = build_angle_by_leaf(architecture)
+    canopy_features = build_canopy_features(architecture)
+    pca_scores, pca_explained = build_pca_tables(angle_by_leaf)
+    canopy_complete, canopy_model_table, canopy_summary = fit_canopy_models(canopy_features)
+
+    tissue_probabilities, tissue_probability_audit = compute_tissue_probabilities(
+        tissue, severe_threshold=severe_threshold
+    )
+    tissue_tests = compute_tissue_ordinal_tests(
+        tissue, severe_threshold=severe_threshold, n_boot=n_boot, seed=seed
+    )
+    ordinal_model_summary, ordinal_lr_tests, ordinal_coefficients = fit_pooled_ordinal_models(tissue)
+
+    defense_allocation, qpcr_allocation_records = compute_defense_allocation(qpcr)
+    alignment = build_alignment_table(tissue_probabilities, defense_allocation)
+    manuscript_table2 = build_manuscript_table2(alignment)
+    manuscript_table_s1 = build_manuscript_table_s1(tissue_tests)
+
+    output_path = out_dir / "Supplementary_Data_S1.xlsx"
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(f"{output_path} already exists. Use --overwrite to replace it.")
+
+    readme_rows = [
+        "This workbook was generated from the three input data files using run_pipeline.py.",
+        "Rows with missing FSP35 lesion scores are excluded from denominators when calculating severe-infection probabilities.",
+        f"Severe infection threshold: FSP35 score >= {severe_threshold}.",
+        f"Bootstrap iterations for tissue effect-size confidence intervals: {n_boot}.",
+        f"Canopy complete-case n: {canopy_summary.n_complete_case}.",
+        f"Canopy model R2 values: lambda linear = {canopy_summary.r2_lambda_linear:.3f}; greenhouse quadratic full = {canopy_summary.r2_greenhouse_quadratic_full:.3f}; greenhouse quadratic slope-only = {canopy_summary.r2_greenhouse_quadratic_slope_only:.3f}.",
+    ]
+
+    write_workbook(
+        output_path=output_path,
+        readme_rows=readme_rows,
+        input_audit=input_audit,
+        angle_by_leaf=angle_by_leaf,
+        canopy_features=canopy_features,
+        pca_scores=pca_scores,
+        pca_explained=pca_explained,
+        canopy_complete=canopy_complete,
+        canopy_model_table=canopy_model_table,
+        tissue_probability_audit=tissue_probability_audit,
+        tissue_probabilities=tissue_probabilities,
+        tissue_tests=tissue_tests,
+        ordinal_model_summary=ordinal_model_summary,
+        ordinal_lr_tests=ordinal_lr_tests,
+        ordinal_coefficients=ordinal_coefficients,
+        qpcr_allocation_records=qpcr_allocation_records,
+        defense_allocation=defense_allocation,
+        alignment=alignment,
+        manuscript_table2=manuscript_table2,
+        manuscript_table_s1=manuscript_table_s1,
+    )
+
+    return output_path, canopy_summary, ordinal_lr_tests, manuscript_table2
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate the supplementary data workbook.")
+    parser.add_argument("--data-dir", default=".", help="Directory containing the three input files.")
+    parser.add_argument("--out-dir", default="outputs", help="Directory for the output workbook.")
+    parser.add_argument("--severe-threshold", type=float, default=SEVERE_THRESHOLD_DEFAULT, help="Threshold for severe infection.")
+    parser.add_argument("--bootstrap-iterations", type=int, default=BOOTSTRAPS_DEFAULT, help="Number of bootstrap iterations.")
+    parser.add_argument("--seed", type=int, default=RANDOM_SEED_DEFAULT, help="Random seed for bootstrap sampling.")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing output workbook.")
+    args = parser.parse_args()
 
     data_dir = Path(args.data_dir).expanduser().resolve()
     out_dir = Path(args.out_dir).expanduser().resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    arch_path = data_dir / "8leaf_final.xlsx"
-    midrib_path = data_dir / "susceptibility score_Midrib.xlsx"
-    qpcr_path = data_dir / "qpcr_leaf_midrib_allocation.csv"
-
-    _require_file(arch_path)
-    _require_file(midrib_path)
-    _require_file(qpcr_path)
-
-    # Load inputs
-    canopy_raw = pd.read_excel(arch_path)
-    midrib_raw = pd.read_excel(midrib_path)
-    qpcr_raw = pd.read_csv(qpcr_path)
-
-    # Derived tables
-    canopy_feats = build_canopy_features(canopy_raw)
-    canopy_cc, model_results = fit_canopy_models(canopy_feats, eps=float(args.eps))
-
-    midrib_probs = compute_midrib_probs(midrib_raw, severe_threshold=float(args.severe_threshold))
-    qpcr_summary = compute_defense_allocation(qpcr_raw)
-
-    alignment = build_alignment_table(midrib_probs, qpcr_summary)
-
-    # Write intermediate CSVs
-    csv_map = {
-        "derived_canopy_features.csv": canopy_feats,
-        "derived_canopy_complete_case.csv": canopy_cc,
-        "derived_midrib_probs.csv": midrib_probs,
-        "derived_qpcr_allocation.csv": qpcr_summary,
-        "derived_alignment_jsd.csv": alignment,
-    }
-    for name, df in csv_map.items():
-        path = out_dir / name
-        if path.exists() and not args.overwrite:
-            continue
-        df.to_csv(path, index=False)
-
-    # Write Excel
-    xlsx_path = out_dir / "Supplementary_Data_S1.xlsx"
-    if xlsx_path.exists() and not args.overwrite:
-        raise FileExistsError(f"{xlsx_path} already exists. Use --overwrite to replace it.")
-    write_supplementary_excel(
-        out_path=xlsx_path,
-        canopy_raw=canopy_raw,
-        canopy_features=canopy_feats,
-        canopy_cc=canopy_cc,
-        midrib_probs=midrib_probs,
-        qpcr_summary=qpcr_summary,
-        alignment=alignment,
-        model_results=model_results,
+    output_path, canopy_summary, ordinal_tests, table2 = run_analysis(
+        data_dir=data_dir,
+        out_dir=out_dir,
+        severe_threshold=args.severe_threshold,
+        n_boot=args.bootstrap_iterations,
+        seed=args.seed,
+        overwrite=args.overwrite,
     )
 
-    print("Wrote outputs to:", out_dir)
-    print("Primary deliverable:", xlsx_path)
-    print(f"Canopy models (complete-case n={model_results.n_complete_case}): "
-          f"R2_full={model_results.r2_funneling_full:.3f}, "
-          f"R2_slope_only={model_results.r2_funneling_slope_only:.3f}, "
-          f"R2_lambda_linear={model_results.r2_lambda_linear:.3f}")
+    print(f"Wrote {output_path}")
+    print(f"Canopy complete-case n = {canopy_summary.n_complete_case}")
+    print(f"Canopy R2, quadratic full model = {canopy_summary.r2_greenhouse_quadratic_full:.3f}")
+    print(f"Canopy R2, quadratic slope-only model = {canopy_summary.r2_greenhouse_quadratic_slope_only:.3f}")
+    if len(ordinal_tests):
+        for _, row in ordinal_tests.iterrows():
+            print(f"{row['comparison']}: p = {row['p_value']:.6g}")
+    if len(table2):
+        print("Corrected Table 2 values were written to sheet 17_Manuscript_Table2.")
 
 
 if __name__ == "__main__":
